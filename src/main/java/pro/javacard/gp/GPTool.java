@@ -20,10 +20,7 @@
  */
 package pro.javacard.gp;
 
-import apdu4j.APDUReplayProvider;
-import apdu4j.HexUtils;
-import apdu4j.LoggingCardTerminal;
-import apdu4j.TerminalManager;
+import apdu4j.*;
 import joptsimple.OptionException;
 import joptsimple.OptionParser;
 import joptsimple.OptionSet;
@@ -37,10 +34,7 @@ import javax.crypto.Cipher;
 import javax.smartcardio.*;
 import javax.smartcardio.CardTerminals.State;
 import java.io.*;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.EnumSet;
-import java.util.List;
+import java.util.*;
 import java.util.stream.Collectors;
 
 import static pro.javacard.gp.PlaintextKeys.Diversification.*;
@@ -57,6 +51,8 @@ public final class GPTool {
     private final static String OPT_DELETE_KEY = "delete-key";
 
     private final static String OPT_DOMAIN = "domain";
+    private final static String OPT_EXTRADITE = "extradite";
+
     private final static String OPT_DUMP = "dump";
     private final static String OPT_EMV = "emv";
     private final static String OPT_FORCE = "force";
@@ -79,7 +75,7 @@ public final class GPTool {
     private final static String OPT_LOCK_ENC = "lock-enc";
     private final static String OPT_LOCK_MAC = "lock-mac";
     private final static String OPT_LOCK_DEK = "lock-dek";
-    private final static String OPT_LOCK_KDF3 = "lock-kdf3";
+
     private final static String OPT_LOCK_APPLET = "lock-applet";
     private final static String OPT_LOCK_CARD = "lock-card";
     private final static String OPT_MAKE_DEFAULT = "make-default";
@@ -104,6 +100,8 @@ public final class GPTool {
     private final static String OPT_TERMINALS = "terminals";
     private final static String OPT_TERMINATE = "terminate";
     private final static String OPT_TODAY = "today";
+    private final static String OPT_TO = "to";
+
     private final static String OPT_UNINSTALL = "uninstall";
     private final static String OPT_UNLOCK = "unlock";
     private final static String OPT_UNLOCK_APPLET = "unlock-applet";
@@ -118,6 +116,8 @@ public final class GPTool {
     private final static String OPT_ACR_DELETE = "acr-delete";
     private final static String OPT_ACR_RULE = "acr-rule";
     private final static String OPT_ACR_CERT_HASH = "acr-hash";
+
+    private static boolean isVerbose = false;
 
     private static OptionSet parseArguments(String[] argv) throws IOException {
         OptionSet args = null;
@@ -159,6 +159,8 @@ public final class GPTool {
         parser.accepts(OPT_UNLOCK_CARD, "Unlock card");
         parser.accepts(OPT_SECURE_CARD, "Transition ISD to SECURED state");
         parser.accepts(OPT_INITIALIZE_CARD, "Transition ISD to INITIALIZED state");
+        parser.accepts(OPT_EXTRADITE, "Extradite to").withRequiredArg().describedAs("AID");
+        parser.accepts(OPT_TO, "Destination security domain").withRequiredArg().describedAs("AID");
 
         parser.accepts(OPT_SET_PRE_PERSO, "Set PrePerso data in CPLC").withRequiredArg().describedAs("data");
         parser.accepts(OPT_SET_PERSO, "Set Perso data in CPLC").withRequiredArg().describedAs("data");
@@ -198,7 +200,7 @@ public final class GPTool {
         parser.accepts(OPT_LOCK_ENC, "Set new ENC key").withRequiredArg().describedAs("key");
         parser.accepts(OPT_LOCK_MAC, "Set new MAC key").withRequiredArg().describedAs("key");
         parser.accepts(OPT_LOCK_DEK, "Set new DEK key").withRequiredArg().describedAs("key");
-        parser.accepts(OPT_LOCK_KDF3, "Set new keys using KDF3").withRequiredArg().describedAs("key");
+
         parser.accepts(OPT_UNLOCK, "Set default key for card key");
         parser.accepts(OPT_NEW_KEY_VERSION, "Key version for the new key").withRequiredArg();
 
@@ -248,6 +250,7 @@ public final class GPTool {
 
         if (args.has(OPT_VERBOSE)) {
             System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "debug");
+            isVerbose = true;
         } else if (args.has(OPT_DEBUG)) {
             System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "trace");
         } else {
@@ -278,6 +281,10 @@ public final class GPTool {
             if (args.has(OPT_INFO)) {
                 System.out.println("**** CAP info of " + capfile.getName());
                 cap.dump(System.out);
+                if (args.specs().size() == 2) {
+                    // Exit after --cap <file> --info
+                    System.exit(0);
+                }
             }
         }
 
@@ -305,13 +312,20 @@ public final class GPTool {
             if (args.has(OPT_DEBUG)) {
                 System.out.println("# Detected readers from " + tf.getProvider().getName());
                 for (CardTerminal term : terminals.list()) {
-                    System.out.println((term.isCardPresent() ? "[*] " : "[ ] ") + term.getName());
+                    String c = " ";
+                    if (term.isCardPresent()) {
+                        c = "*";
+                        if (ignoreReader(term.getName())) {
+                            c = "I";
+                        }
+                    }
+                    System.out.println("[" + c + "] " + term.getName());
                 }
             }
 
             // Select terminal(s) to work on
             List<CardTerminal> do_readers;
-            if (args.has(OPT_READER) || System.getenv("GP_READER") != null) {
+            if (args.has(OPT_READER) || System.getenv().containsKey("GP_READER")) {
                 String reader = System.getenv("GP_READER");
                 if (args.has(OPT_READER))
                     reader = (String) args.valueOf(OPT_READER);
@@ -321,12 +335,23 @@ public final class GPTool {
                 }
                 do_readers = Arrays.asList(t);
             } else {
-                do_readers = terminals.list(State.CARD_PRESENT);
+                List<CardTerminal> tmp = terminals.list(State.CARD_PRESENT);
+                do_readers = new ArrayList<>();
+                for (CardTerminal t : tmp) {
+                    if (!ignoreReader(t.getName())) {
+                        do_readers.add(t);
+                    } else {
+                        if (args.has(OPT_VERBOSE)) {
+                            System.out.println("# Ignoring " + t.getName());
+                        }
+                    }
+                }
             }
 
             if (do_readers.size() == 0) {
                 fail("No smart card readers with a card found");
             }
+
             // Work all readers
             for (CardTerminal reader : do_readers) {
                 if (do_readers.size() > 1) {
@@ -348,7 +373,7 @@ public final class GPTool {
                     // Establish connection
                     try {
                         card = reader.connect("*");
-                        // Use use apdu4j which by default uses jnasmartcardio
+                        // We use apdu4j which by default uses jnasmartcardio
                         // which uses real SCardBeginTransaction
                         card.beginExclusive();
                     } catch (CardException e) {
@@ -366,6 +391,17 @@ public final class GPTool {
 
                     // Send all raw APDU-s to the default-selected application of the card
                     if (args.has(OPT_APDU)) {
+                        // Select the application, if present
+                        AID target = null;
+                        if (args.has(OPT_APPLET)) {
+                            target = AID.fromString(args.valueOf(OPT_APPLET));
+                        } else if (cap != null) {
+                            target = cap.getAppletAIDs().get(0); // FIXME: generalize and only work if one 
+                        }
+                        if (target != null) {
+                            verbose("Selecting " + target);
+                            card.getBasicChannel().transmit(new CommandAPDU(0x00, ISO7816.INS_SELECT, 0x04, 0x00, target.getBytes()));
+                        }
                         for (Object s : args.valuesOf(OPT_APDU)) {
                             CommandAPDU c = new CommandAPDU(HexUtils.stringToBin((String) s));
                             card.getBasicChannel().transmit(c);
@@ -408,11 +444,17 @@ public final class GPTool {
                             }
                             keyz = PlaintextKeys.fromMasterKey(k);
                         } else {
+                            Map<String, String> env = System.getenv();
                             // XXX: better checks for exclusive key options
                             if (args.has(OPT_KEY_MAC) && args.has(OPT_KEY_ENC) && args.has(OPT_KEY_DEK)) {
                                 GPKey enc = new GPKey(HexUtils.stringToBin((String) args.valueOf(OPT_KEY_ENC)));
                                 GPKey mac = new GPKey(HexUtils.stringToBin((String) args.valueOf(OPT_KEY_MAC)));
                                 GPKey dek = new GPKey(HexUtils.stringToBin((String) args.valueOf(OPT_KEY_DEK)));
+                                keyz = PlaintextKeys.fromKeys(enc, mac, dek);
+                            } else if (env.containsKey("GP_KEY_ENC") && env.containsKey("GP_KEY_MAC") && env.containsKey("GP_KEY_DEK")) {
+                                GPKey enc = new GPKey(HexUtils.stringToBin(env.get("GP_KEY_ENC")));
+                                GPKey mac = new GPKey(HexUtils.stringToBin(env.get("GP_KEY_MAC")));
+                                GPKey dek = new GPKey(HexUtils.stringToBin(env.get("GP_KEY_DEK")));
                                 keyz = PlaintextKeys.fromKeys(enc, mac, dek);
                             } else {
                                 if (needsAuthentication(args)) {
@@ -534,17 +576,19 @@ public final class GPTool {
                             File capfile = (File) args.valueOf(OPT_LOAD);
                             CAPFile loadcap = new CAPFile(new FileInputStream(capfile));
 
-                            if (args.has(OPT_VERBOSE)) {
+                            if (isVerbose) {
                                 loadcap.dump(System.out);
                             }
                             try {
-                                gp.loadCapFile(loadcap);
+                                AID target = null;
+                                if (args.has(OPT_TO))
+                                    target = AID.fromString(args.valueOf(OPT_TO));
+                                gp.loadCapFile(loadcap, target);
                             } catch (GPException e) {
                                 if (e.sw == 0x6985) {
                                     System.err.println("Applet loading failed. Are you sure the CAP file target is compatible with your card?");
-                                } else {
-                                    throw e;
                                 }
+                                throw e;
                             }
                         }
 
@@ -598,11 +642,14 @@ public final class GPTool {
                             }
 
                             try {
-                                gp.loadCapFile(instcap);
+                                AID target = null;
+                                if (args.has(OPT_TO))
+                                    target = AID.fromString(args.valueOf(OPT_TO));
+                                gp.loadCapFile(instcap, target);
                                 System.out.println("CAP loaded");
                             } catch (GPException e) {
                                 if (e.sw == 0x6985 || e.sw == 0x6A80) {
-                                    System.err.println("Applet loading failed. Are you sure the CAP file (JC version, packages) is compatible with your card?");
+                                    System.err.println("Applet loading failed. Are you sure the CAP file (JC version, packages, sizes) is compatible with your card?");
                                 }
                                 throw e;
                             }
@@ -616,7 +663,7 @@ public final class GPTool {
                         }
 
                         // --create <aid> (--applet <aid> --package <aid> or --cap <cap>)
-                        if (args.has(OPT_CREATE)) {
+                        if (args.has(OPT_CREATE) && !args.has(OPT_INSTALL)) {
                             AID packageAID = null;
                             AID appletAID = null;
 
@@ -662,7 +709,7 @@ public final class GPTool {
                                 packageAID = AID.fromString(args.valueOf(OPT_PACKAGE));
                                 appletAID = AID.fromString(args.valueOf(OPT_APPLET));
                             } else {
-                                System.out.println("Note: using default AID-s for SSD: " + appletAID + " from " + packageAID);
+                                System.out.println("Note: using default AID-s for SSD instantiation: " + appletAID + " from " + packageAID);
                             }
                             AID instanceAID = AID.fromString(args.valueOf(OPT_DOMAIN));
 
@@ -671,15 +718,26 @@ public final class GPTool {
                             privs.add(Privilege.SecurityDomain);
 
                             // shoot
-                            gp.installAndMakeSelectable(packageAID, appletAID, instanceAID, privs, null, null);
+                            gp.installAndMakeSelectable(packageAID, appletAID, instanceAID, privs, getInstParams(args), null);
+                        }
+
+                        // --extradite <AID>
+                        if (args.has(OPT_EXTRADITE)) {
+                            if (!args.has(OPT_TO)) {
+                                fail("Specify extradition target with --" + OPT_TO);
+                            }
+                            AID what = AID.fromString(args.valueOf(OPT_EXTRADITE));
+                            AID to = AID.fromString(args.valueOf(OPT_TO));
+
+                            gp.extradite(what, to);
                         }
 
                         // --store-data <XX>
                         if (args.has(OPT_STORE_DATA)) {
                             if (args.has(OPT_APPLET)) {
-                                gp.storeData(AID.fromString(args.valueOf(OPT_APPLET)), HexUtils.stringToBin((String) args.valueOf(OPT_STORE_DATA)));
+                                gp.personalize(AID.fromString(args.valueOf(OPT_APPLET)), HexUtils.stringToBin((String) args.valueOf(OPT_STORE_DATA)));
                             } else {
-                                System.err.println("Must specify target application with -" + OPT_APPLET);
+                                gp.storeData(HexUtils.stringToBin((String) args.valueOf(OPT_STORE_DATA)), 0x0);
                             }
                         }
 
@@ -791,12 +849,12 @@ public final class GPTool {
 
                             gp.putKeys(newkeys, replace, null);
 
-                            System.out.println("Default " + new_key.toString() + " set as master key.");
+                            System.out.println("Default " + new_key.toString() + " set as master key for " + gp.getAID());
                         }
 
                         // --lock
-                        if (args.has(OPT_LOCK_KDF3) || args.has(OPT_LOCK) || (args.has(OPT_LOCK_ENC) && args.has(OPT_LOCK_MAC) && args.has(OPT_LOCK_DEK))) {
-                           // By default we try to change an existing key
+                        if (args.has(OPT_LOCK) || (args.has(OPT_LOCK_ENC) && args.has(OPT_LOCK_MAC) && args.has(OPT_LOCK_DEK))) {
+                            // By default we try to change an existing key
                             boolean replace = true;
                             List<GPKey> current = gp.getKeyInfoTemplate();
 
@@ -814,7 +872,6 @@ public final class GPTool {
                             }
                             // Add into a list
                             List<GPKey> updatekeys = new ArrayList<>();
-
 
 
                             // If a specific new key version is specified, use that instead.
@@ -861,19 +918,34 @@ public final class GPTool {
                                     nk3.become(Type.DES3);
                                 }
 
+                            // Get key value or values
+                            List<GPKey> updatekeys = new ArrayList<>();
+                            if (args.has(OPT_LOCK_ENC) && args.has(OPT_LOCK_MAC) && args.has(OPT_LOCK_DEK)) {
+                                updatekeys.add(new GPKey(new_version, 1, new GPKey(HexUtils.stringToBin((String) args.valueOf(OPT_LOCK_ENC)))));
+                                updatekeys.add(new GPKey(new_version, 2, new GPKey(HexUtils.stringToBin((String) args.valueOf(OPT_LOCK_MAC)))));
+                                updatekeys.add(new GPKey(new_version, 3, new GPKey(HexUtils.stringToBin((String) args.valueOf(OPT_LOCK_DEK)))));
+                            } else {
+                                GPKey nk = new GPKey(HexUtils.stringToBin((String) args.valueOf(OPT_LOCK)));
                                 // We currently use the same key, diversification is missing
-                                updatekeys.add(new GPKey(new_version, 1, nk1));
-                                updatekeys.add(new GPKey(new_version, 2, nk2));
-                                updatekeys.add(new GPKey(new_version, 3, nk3));
-                                gp.putKeys(updatekeys, replace,null);
-                                System.out.println("Card locked with ENC: " + HexUtils.bin2hex(nk1.getBytes()));
-                                System.out.println("Card locked with MAC: " + HexUtils.bin2hex(nk2.getBytes()));
-                                System.out.println("Card locked with DEK: " + HexUtils.bin2hex(nk3.getBytes()));
+                                updatekeys.add(new GPKey(new_version, 1, nk));
+                                updatekeys.add(new GPKey(new_version, 2, nk));
+                                updatekeys.add(new GPKey(new_version, 3, nk));
+                            }
 
+                            // XXX: this is uggely
+                            Type t = gp.getSCPVersion() == 3 ? Type.AES : Type.DES3;
+                            for (GPKey k : updatekeys) {
+                                k.become(t);
                             }
 
 
-                            System.out.println("DO NOT FORGET/LOSE the key/s!");
+                            if (args.has(OPT_LOCK)) {
+                                System.out.println("Card locked with: " + HexUtils.bin2hex(HexUtils.stringToBin((String) args.valueOf(OPT_LOCK))));
+                                System.out.println("Write this down, DO NOT FORGET/LOSE IT!");
+                            } else {
+                                System.out.println("Card locked with new keys.");
+                                System.out.println("Write them down, DO NOT FORGET/LOSE THEM!");
+                            }
                         }
 
                         // --make-default <aid>
@@ -887,7 +959,7 @@ public final class GPTool {
                         }
                         // --set-pre-perso
                         if (args.has(OPT_SET_PRE_PERSO)) {
-                            byte [] payload = HexUtils.stringToBin((String) args.valueOf(OPT_SET_PRE_PERSO));
+                            byte[] payload = HexUtils.stringToBin((String) args.valueOf(OPT_SET_PRE_PERSO));
                             if (args.has(OPT_TODAY)) {
                                 System.arraycopy(GPData.CPLC.today(), 0, payload, 2, 2);
                             }
@@ -895,7 +967,7 @@ public final class GPTool {
                         }
                         // --set-perso
                         if (args.has(OPT_SET_PERSO)) {
-                            byte [] payload = HexUtils.stringToBin((String) args.valueOf(OPT_SET_PERSO));
+                            byte[] payload = HexUtils.stringToBin((String) args.valueOf(OPT_SET_PERSO));
                             if (args.has(OPT_TODAY)) {
                                 System.arraycopy(GPData.CPLC.today(), 0, payload, 2, 2);
                             }
@@ -988,28 +1060,41 @@ public final class GPTool {
         return params;
     }
 
+    private static boolean ignoreReader(String name) {
+        String ignore = System.getenv("GP_READER_IGNORE");
+        if (ignore != null) {
+            String[] names = ignore.toLowerCase().split(";");
+            for (String n : names) {
+                if (name.toLowerCase().contains(n)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private static boolean needsAuthentication(OptionSet args) {
-        if (args.has(OPT_LIST) || args.has(OPT_LOAD) || args.has(OPT_INSTALL))
-            return true;
-        if (args.has(OPT_DELETE_KEY) || args.has(OPT_DELETE) || args.has(OPT_CREATE))
-            return true;
-        if (args.has(OPT_ACR_ADD) || args.has(OPT_ACR_DELETE))
-            return true;
-        if (args.has(OPT_LOCK_KDF3) || args.has(OPT_LOCK) || (args.has(OPT_LOCK_ENC) && args.has(OPT_LOCK_MAC) && args.has(OPT_LOCK_DEK))|| args.has(OPT_UNLOCK) || args.has(OPT_MAKE_DEFAULT))
-            return true;
-        if (args.has(OPT_UNINSTALL) || args.has(OPT_SECURE_APDU) || args.has(OPT_DOMAIN))
-            return true;
-        if (args.has(OPT_LOCK_CARD) || args.has(OPT_UNLOCK_CARD) || args.has(OPT_LOCK_APPLET) || args.has(OPT_UNLOCK_APPLET))
-            return true;
-        if (args.has(OPT_STORE_DATA) || args.has(OPT_INITIALIZE_CARD) || args.has(OPT_SECURE_CARD) || args.has(OPT_RENAME_ISD))
-            return true;
-        if (args.has(OPT_SET_PRE_PERSO) || args.has(OPT_SET_PERSO))
-            return true;
+        String[] yes = new String[]{OPT_LIST, OPT_LOAD, OPT_INSTALL, OPT_DELETE, OPT_DELETE_KEY, OPT_CREATE,
+                OPT_ACR_ADD, OPT_ACR_DELETE, OPT_LOCK, OPT_UNLOCK, OPT_LOCK_ENC, OPT_LOCK_MAC, OPT_LOCK_DEK, OPT_MAKE_DEFAULT,
+                OPT_UNINSTALL, OPT_SECURE_APDU, OPT_DOMAIN, OPT_LOCK_CARD, OPT_UNLOCK_CARD, OPT_LOCK_APPLET, OPT_UNLOCK_APPLET,
+                OPT_STORE_DATA, OPT_INITIALIZE_CARD, OPT_SECURE_CARD, OPT_RENAME_ISD, OPT_SET_PERSO, OPT_SET_PRE_PERSO, OPT_EXTRADITE};
+
+        for (String s : yes) {
+            if (args.has(s)) {
+                return true;
+            }
+        }
         return false;
     }
 
     private static void fail(String msg) {
         System.err.println(msg);
         System.exit(1);
+    }
+
+    private static void verbose(String s) {
+        if (isVerbose) {
+            System.out.println("# " + s);
+        }
     }
 }

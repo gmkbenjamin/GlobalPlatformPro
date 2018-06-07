@@ -216,7 +216,10 @@ public class GlobalPlatform implements AutoCloseable {
     public AID getAID() {
         return new AID(sdAID.getBytes());
     }
-    public CardChannel getCardChannel() { return channel; }
+
+    public CardChannel getCardChannel() {
+        return channel;
+    }
 
     protected void giveStrictWarning(String message) throws GPException {
         message = "STRICT WARNING: " + message;
@@ -541,10 +544,16 @@ public class GlobalPlatform implements AutoCloseable {
     }
 
     public void loadCapFile(CAPFile cap) throws CardException, GPException {
-        loadCapFile(cap, false, false, false, false);
+        loadCapFile(cap, sdAID, false, false, false, false);
     }
 
-    private void loadCapFile(CAPFile cap, boolean includeDebug, boolean separateComponents, boolean loadParam, boolean useHash)
+    public void loadCapFile(CAPFile cap, AID target) throws CardException, GPException {
+        if (target == null)
+            target = sdAID;
+        loadCapFile(cap, target, false, false, false, false);
+    }
+
+    private void loadCapFile(CAPFile cap, AID sdaid, boolean includeDebug, boolean separateComponents, boolean loadParam, boolean useHash)
             throws GPException, CardException {
 
         if (getRegistry().allAIDs().contains(cap.getPackageAID())) {
@@ -562,8 +571,8 @@ public class GlobalPlatform implements AutoCloseable {
             bo.write(cap.getPackageAID().getLength());
             bo.write(cap.getPackageAID().getBytes());
 
-            bo.write(sdAID.getLength());
-            bo.write(sdAID.getBytes());
+            bo.write(sdaid.getLength());
+            bo.write(sdaid.getBytes());
 
             bo.write(hash.length);
             bo.write(hash);
@@ -657,10 +666,36 @@ public class GlobalPlatform implements AutoCloseable {
 
         CommandAPDU install = new CommandAPDU(CLA_GP, INS_INSTALL, 0x0C, 0x00, bo.toByteArray());
         ResponseAPDU response = transmit(install);
-        GPException.check(response, "Install for Install and make selectable failed");
+        GPException.check(response, "INSTALL [for install and make selectable] failed");
         dirty = true;
     }
 
+    public void extradite(AID what, AID to) throws GPException, CardException {
+        // GP 2.2.1 Table 11-45
+        ByteArrayOutputStream bo = new ByteArrayOutputStream();
+        try {
+            bo.write(to.getLength());
+            bo.write(to.getBytes());
+
+            bo.write(0x00);
+            bo.write(what.getLength());
+            bo.write(what.getBytes());
+
+            bo.write(0x00);
+
+            bo.write(0x00); // no extradition parameters
+            bo.write(0x00); // no extradition token
+        } catch (IOException ioe) {
+            throw new RuntimeException(ioe);
+        }
+
+        CommandAPDU install = new CommandAPDU(CLA_GP, INS_INSTALL, 0x10, 0x00, bo.toByteArray());
+        ResponseAPDU response = transmit(install);
+        GPException.check(response, "INSTALL [for extradition] failed");
+        dirty = true;
+    }
+
+
     /**
      * Sends STORE DATA commands to the application identified
      *
@@ -668,8 +703,8 @@ public class GlobalPlatform implements AutoCloseable {
      * @throws GPException
      * @throws CardException
      */
-    public void storeData(AID aid, byte[] data) throws CardException, GPException {
-        storeData(aid, data, (byte) 0x80);
+    public void personalize(AID aid, byte[] data) throws CardException, GPException {
+        personalize(aid, data, 0x80);
     }
 
     /**
@@ -679,11 +714,11 @@ public class GlobalPlatform implements AutoCloseable {
      * @throws GPException
      * @throws CardException
      */
-    public void storeData(AID aid, byte[] data, byte P1) throws CardException, GPException {
+    public void personalize(AID aid, byte[] data, int P1) throws CardException, GPException {
         // send the INSTALL for personalization command
         ByteArrayOutputStream bo = new ByteArrayOutputStream();
         try {
-            // GP 2.1.1 9.5.2.3.5
+            // GP 2.1.1 9.5.2.3.5, 2.2.1 - 11.5.2.3.6
             bo.write(0);
             bo.write(0);
             bo.write(aid.getLength());
@@ -694,18 +729,24 @@ public class GlobalPlatform implements AutoCloseable {
         } catch (IOException ioe) {
             throw new RuntimeException(ioe);
         }
-        CommandAPDU install = new CommandAPDU(CLA_GP, INS_INSTALL, 0x20, 0x00, bo.toByteArray());
+        CommandAPDU install = new CommandAPDU(CLA_GP, INS_INSTALL, 0x20, 0x00, bo.toByteArray(), 256);
         ResponseAPDU response = transmit(install);
-        GPException.check(response, "Install for personalization failed");
+        GPException.check(response, "INSTALL [for personalization] failed");
 
         // Now pump the data
+        storeData(data, P1);
+    }
+
+    // Send a GP-formatted STORE DATA block, splitting as necessary
+    public void storeData(byte[] data, int P1) throws CardException, GPException {
         List<byte[]> blocks = GPUtils.splitArray(data, wrapper.getBlockSize());
         for (int i = 0; i < blocks.size(); i++) {
-            CommandAPDU load = new CommandAPDU(CLA_GP, INS_STORE_DATA, (i == (blocks.size() - 1)) ? P1 : 0x00, (byte) i, blocks.get(i));
-            response = transmit(load);
+            CommandAPDU load = new CommandAPDU(CLA_GP, INS_STORE_DATA, (i == (blocks.size() - 1)) ? P1 | 0x80 : P1 & 0x7F, i, blocks.get(i), 256);
+            ResponseAPDU response = transmit(load);
             GPException.check(response, "STORE DATA failed");
         }
     }
+
 
     public void makeDefaultSelected(AID aid) throws CardException, GPException {
         // FIXME: only works for some 2.1.1 cards ? Clarify and document
@@ -729,7 +770,7 @@ public class GlobalPlatform implements AutoCloseable {
 
         CommandAPDU install = new CommandAPDU(CLA_GP, INS_INSTALL, 0x08, 0x00, bo.toByteArray());
         ResponseAPDU response = transmit(install);
-        GPException.check(response, "Install for make selectable failed");
+        GPException.check(response, "INSTALL [for make selectable] failed");
         dirty = true;
     }
 
